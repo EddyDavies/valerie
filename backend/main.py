@@ -34,7 +34,6 @@ def build_config() -> PipelineConfig:
         "MONGO_URI",
         "MONGO_DATABASE",
         "MONGO_COLLECTION",
-        "S3_BUCKET_NAME",
     ]
 
     missing = [key for key in required_keys if key not in environ]
@@ -57,11 +56,8 @@ def build_config() -> PipelineConfig:
         mongo_uri=environ["MONGO_URI"],
         mongo_database=environ["MONGO_DATABASE"],
         mongo_collection=environ["MONGO_COLLECTION"],
-        s3_bucket=environ["S3_BUCKET_NAME"],
         gemini_model=environ.get("GEMINI_MODEL", "gemini-1.5-pro-latest"),
         video_url_key=environ.get("APIFY_VIDEO_URL_KEY", "videoUrl"),
-        s3_prefix=environ.get("S3_KEY_PREFIX"),
-        aws_region=environ.get("AWS_REGION"),
     )
 
 

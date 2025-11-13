@@ -1,15 +1,14 @@
 """Prefect flow that pulls video data from Apify, analyzes it with Gemini, and
-stores the output alongside an S3 reference in MongoDB."""
+stores the output in MongoDB without persisting artifacts to S3."""
 
 from __future__ import annotations
 
+import shutil
 import tempfile
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import boto3
 import google.generativeai as genai
 import httpx
 from pymongo import MongoClient
@@ -28,11 +27,8 @@ class PipelineConfig:
     mongo_uri: str
     mongo_database: str
     mongo_collection: str
-    s3_bucket: str
     gemini_model: str = "gemini-1.5-pro-latest"
     video_url_key: str = "videoUrl"
-    s3_prefix: str | None = None
-    aws_region: str | None = None
 
 
 @dataclass(slots=True)
@@ -179,24 +175,31 @@ def call_gemini(
     return response_dict
 
 
-@task(name="Upload video to S3", retries=2, retry_delay_seconds=15)
-def upload_to_s3(
-    video_path: Path, bucket: str, prefix: str | None, region: str | None
-) -> str:
-    """Upload the downloaded video to S3 and return the object URI."""
+@task(name="Delete local video", persist_result=False)
+def delete_local_video(video_path: Path) -> None:
+    """Remove the locally stored video file and its temporary directory."""
     logger = get_run_logger()
-    logger.info("Uploading %s to S3 bucket %s", video_path, bucket)
 
-    file_suffix = video_path.suffix or ".mp4"
-    safe_prefix = (prefix or "").strip("/")
-    object_key = f"{safe_prefix + '/' if safe_prefix else ''}{uuid.uuid4().hex}{file_suffix}"
+    if not isinstance(video_path, Path):
+        logger.warning("Expected Path in delete_local_video, got %s", type(video_path))
+        return
 
-    s3_client = boto3.client("s3", region_name=region) if region else boto3.client("s3")
-    s3_client.upload_file(str(video_path), bucket, object_key)
+    try:
+        if video_path.exists():
+            video_path.unlink()
+            logger.info("Deleted local video file %s", video_path)
+        else:
+            logger.info("Local video file already removed: %s", video_path)
+    except OSError as exc:
+        logger.warning("Failed to delete local video file %s: %s", video_path, exc)
 
-    s3_uri = f"s3://{bucket}/{object_key}"
-    logger.info("Uploaded video to %s", s3_uri)
-    return s3_uri
+    temp_dir = video_path.parent
+    if temp_dir.exists():
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info("Removed temporary directory %s", temp_dir)
+        except OSError as exc:
+            logger.warning("Failed to remove temporary directory %s: %s", temp_dir, exc)
 
 
 @task(name="Persist Gemini response to MongoDB")
@@ -204,13 +207,15 @@ def persist_response(
     mongo_uri: str,
     database: str,
     collection: str,
-    s3_uri: str,
     gemini_payload: dict[str, Any],
+    video_url: str,
+    video_payload: dict[str, Any],
 ) -> str:
-    """Persist only the Gemini output and S3 reference in MongoDB."""
+    """Persist the Gemini output and source metadata in MongoDB."""
     logger = get_run_logger()
     document = {
-        "s3_uri": s3_uri,
+        "video_url": video_url,
+        "video_payload": video_payload,
         "output": gemini_payload,
     }
 
@@ -238,31 +243,30 @@ def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
         config.gemini_model,
     )
 
-    s3_uri_future = upload_to_s3.submit(
-        video_path,
-        config.s3_bucket,
-        config.s3_prefix,
-        config.aws_region,
-    )
     gemini_response = gemini_response_future.result()
-    s3_uri = s3_uri_future.result()
 
     document_id = persist_response.submit(
         config.mongo_uri,
         config.mongo_database,
         config.mongo_collection,
-        s3_uri,
         gemini_response,
+        artifact.url,
+        artifact.payload,
     ).result()
 
+    cleanup_future = delete_local_video.submit(
+        video_path, wait_for=[gemini_response_future]
+    )
+    cleanup_future.result()
+
     logger.info(
-        "Pipeline complete; stored output under MongoDB document %s referencing %s",
+        "Pipeline complete; stored output under MongoDB document %s for video %s",
         document_id,
-        s3_uri,
+        artifact.url,
     )
     return {
         "document_id": document_id,
-        "s3_uri": s3_uri,
+        "video_url": artifact.url,
         "apify_actor_id": config.apify_actor_id,
     }
 
