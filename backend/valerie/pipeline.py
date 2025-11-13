@@ -3,11 +3,13 @@ stores the output in MongoDB without persisting artifacts to S3."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from uuid import uuid4
 
 import google.generativeai as genai
 import httpx
@@ -24,11 +26,11 @@ class PipelineConfig:
     apify_input: dict[str, Any]
     gemini_api_key: str
     system_prompt: str
-    mongo_uri: str
-    mongo_database: str
-    mongo_collection: str
-    gemini_model: str = "gemini-1.5-pro-latest"
-    video_url_key: str = "videoUrl"
+    mongo_uri: str | None
+    mongo_database: str | None
+    mongo_collection: str | None
+    gemini_model: str = "gemini-2.5-pro"
+    run_local: bool = False
 
 
 @dataclass(slots=True)
@@ -92,39 +94,26 @@ def _pick_url(value: Any) -> str | None:
 
 
 @task(name="Select video payload")
-def select_video_payload(
-    items: Iterable[dict[str, Any]], video_url_key: str
-) -> VideoArtifact:
+def select_video_payload(items: Iterable[dict[str, Any]]) -> VideoArtifact:
     """Pick the first dataset item that contains a downloadable video URL."""
     logger = get_run_logger()
-    fallback_keys = {
-        video_url_key,
-        video_url_key.lower(),
-        "videoUrl",
-        "videoUrlNoWatermark",
-        "video_url",
-    }
-
     for item in items:
         if not isinstance(item, dict):
             continue
+        media_urls = item.get("mediaUrls")
         url: str | None = None
-        for key in fallback_keys:
-            url = _pick_url(item.get(key))
-            if url:
-                break
-        if not url:
-            video_meta = item.get("video")
-            if isinstance(video_meta, dict):
-                url = _pick_url(video_meta.get(video_url_key)) or _pick_url(video_meta)
+        if isinstance(media_urls, list):
+            first_entry = media_urls[0] if media_urls else None
+            if isinstance(first_entry, dict):
+                url = _pick_url(first_entry.get("url")) or _pick_url(first_entry)
+            else:
+                url = _pick_url(first_entry)
 
         if url:
             logger.info("Selected video URL %s", url)
             return VideoArtifact(url=url, payload=item)
 
-    raise PipelineError(
-        f"No items with key '{video_url_key}' were found in the Apify dataset."
-    )
+    raise PipelineError("Apify dataset did not include mediaUrls entries.")
 
 
 @task(name="Download video", retries=2, retry_delay_seconds=15)
@@ -227,6 +216,25 @@ def persist_response(
     return inserted_id
 
 
+# --- Local persistence fallback (RUN_LOCAL), remove when Mongo is mandatory ---
+@task(name="Persist Gemini response locally", persist_result=False)
+def persist_response_locally(document: dict[str, Any]) -> str:
+    """Persist the Gemini output to a local JSON file when MongoDB is disabled."""
+    logger = get_run_logger()
+    output_dir = Path(__file__).resolve().parent / "local_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_stub = "".join(
+        character if character.isalnum() else "-" for character in document["video_url"]
+    )[:60].strip("-") or "video"
+
+    file_path = output_dir / f"{safe_stub}-{uuid4().hex}.json"
+    file_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+
+    logger.info("Saved Gemini response locally to %s", file_path)
+    return str(file_path)
+
+
 @flow(name="Apify to Gemini pipeline")
 def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
     """Prefect entry point that orchestrates the full pipeline."""
@@ -234,7 +242,7 @@ def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
     logger.info("Starting Apify to Gemini pipeline")
 
     items = run_apify_actor.submit(config).result()
-    artifact = select_video_payload.submit(items, config.video_url_key).result()
+    artifact = select_video_payload.submit(items).result()
     video_path = download_video.submit(artifact).result()
     gemini_response_future = call_gemini.submit(
         video_path,
@@ -245,14 +253,23 @@ def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
 
     gemini_response = gemini_response_future.result()
 
-    document_id = persist_response.submit(
-        config.mongo_uri,
-        config.mongo_database,
-        config.mongo_collection,
-        gemini_response,
-        artifact.url,
-        artifact.payload,
-    ).result()
+    document = {
+        "video_url": artifact.url,
+        "video_payload": artifact.payload,
+        "output": gemini_response,
+    }
+
+    if config.run_local:
+        document_id = persist_response_locally.submit(document).result()
+    else:
+        document_id = persist_response.submit(
+            config.mongo_uri or "",
+            config.mongo_database or "",
+            config.mongo_collection or "",
+            gemini_response,
+            artifact.url,
+            artifact.payload,
+        ).result()
 
     cleanup_future = delete_local_video.submit(
         video_path, wait_for=[gemini_response_future]

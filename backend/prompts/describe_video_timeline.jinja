@@ -1,0 +1,17 @@
+Describe the video content as a detailed timeline broken down by second ranges.
+
+For each segment, provide:
+- `start_second` and `end_second`
+- A concise description of the visuals, actions, and any on-screen text
+- Notable audio or narration that occurs
+
+Identify any frames that should be captured as screenshots by supplying:
+- The specific second and millisecond to capture
+- A short justification for why the frame is important
+
+Return the results as structured JSON with two top-level keys:
+- `timeline`: an ordered list of segments
+- `screenshots`: an ordered list of screenshot suggestions
+
+Be direct, factual, and keep descriptions brief but informative.
+

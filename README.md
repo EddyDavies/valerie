@@ -13,42 +13,31 @@ This project contains a Prefect flow that
 uv sync
 ```
 
+If `APIFY_ACTOR_ID` is omitted, the backend defaults to `clockworks~tiktok-video-scraper`.
+
 Create a `.env` file in the project root with:
 
 ```
-APIFY_ACTOR_ID=clockworks~tiktok-video-scraper
 APIFY_API_TOKEN=your-apify-api-token
 GEMINI_API_KEY=your-google-gemini-key
 MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net
 MONGO_DATABASE=app
 MONGO_COLLECTION=gemini_outputs
-# Either point to an input file or provide inline JSON (choose one)
-APIFY_INPUT_PATH=./apify-input.json
-# APIFY_INPUT_JSON={"postURLs":["https://vm.tiktok.com/ZNdE8MYnM/"],"resultsPerPage":100,...}
 # Optional overrides
-GEMINI_SYSTEM_PROMPT=You are a helpful assistant...
-GEMINI_MODEL=gemini-1.5-pro-latest
-APIFY_VIDEO_URL_KEY=videoUrl
+RUN_LOCAL=false
+APIFY_ACTOR_ID=clockworks~tiktok-video-scraper
+GEMINI_PROMPT_NAME=describe_video_timeline
+GEMINI_MODEL=gemini-2.5-pro
 ```
 
-The sample `APIFY_INPUT_JSON` above mirrors the TikTok scraper input:
-
-```json
-{
-  "postURLs": ["https://vm.tiktok.com/ZNdE8MYnM/"],
-  "resultsPerPage": 100,
-  "scrapeRelatedVideos": false,
-  "shouldDownloadCovers": false,
-  "shouldDownloadSlideshowImages": false,
-  "shouldDownloadSubtitles": true,
-  "shouldDownloadVideos": true
-}
-```
+System prompts live in `backend/prompts/` as Jinja templates. Set `GEMINI_PROMPT_NAME`
+to the template filename (without `.jinja`). The default `describe_video_timeline`
+prompt turns Gemini output into a second-by-second timeline with screenshot suggestions.
 
 ### 2. Run the flow locally
 
 ```bash
-uv run python main.py
+uv run python main.py --url "https://vm.tiktok.com/your-video/"
 ```
 
 You can also trigger it via Prefect CLI:
@@ -66,4 +55,6 @@ The flow logs each step in Prefect and prints the MongoDB document ID and source
 - Gemini uploads are cleaned up after each run.
 - Apify runs use the `run-sync-get-dataset-items` endpoint, so the flow waits for the actor to complete and uses the returned dataset items.
 - Only the Gemini output, the original Apify payload, and the source video URL are saved in MongoDB. 
+- The Apify actor input is generated dynamically; pass the target URL via `--url` or set `APIFY_POST_URL`.
+- Set `RUN_LOCAL=true` to activate the temporary JSON fallback (`backend/valerie/local_outputs/`) when MongoDB is unavailable. Remove this flag once Mongo connectivity is guaranteed.
 
