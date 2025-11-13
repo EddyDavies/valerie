@@ -1,15 +1,34 @@
+import json
 from os import environ
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
 from valerie.pipeline import PipelineConfig, apify_to_gemini_flow
 
 
+def load_apify_input() -> dict[str, Any]:
+    """Load Apify actor input from a file path or inline JSON."""
+    if "APIFY_INPUT_PATH" in environ:
+        input_path = Path(environ["APIFY_INPUT_PATH"]).expanduser().resolve()
+        if not input_path.exists():
+            raise RuntimeError(f"APIFY_INPUT_PATH does not exist: {input_path}")
+        return json.loads(input_path.read_text())
+
+    if "APIFY_INPUT_JSON" in environ:
+        return json.loads(environ["APIFY_INPUT_JSON"])
+
+    raise RuntimeError(
+        "Provide either APIFY_INPUT_PATH pointing to a JSON file or "
+        "APIFY_INPUT_JSON containing the serialized actor input."
+    )
+
+
 def build_config() -> PipelineConfig:
     """Construct a pipeline configuration from environment variables."""
     required_keys = [
-        "APIFY_DATASET_ID",
+        "APIFY_ACTOR_ID",
         "APIFY_API_TOKEN",
         "GEMINI_API_KEY",
         "MONGO_URI",
@@ -27,8 +46,9 @@ def build_config() -> PipelineConfig:
         )
 
     return PipelineConfig(
-        apify_dataset_id=environ["APIFY_DATASET_ID"],
+        apify_actor_id=environ["APIFY_ACTOR_ID"],
         apify_token=environ["APIFY_API_TOKEN"],
+        apify_input=load_apify_input(),
         gemini_api_key=environ["GEMINI_API_KEY"],
         system_prompt=environ.get(
             "GEMINI_SYSTEM_PROMPT",

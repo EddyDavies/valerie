@@ -16,13 +16,16 @@ uv sync
 Create a `.env` file in the project root with:
 
 ```
-APIFY_DATASET_ID=the-dataset-you-want-to-read
+APIFY_ACTOR_ID=clockworks~tiktok-video-scraper
 APIFY_API_TOKEN=your-apify-api-token
 GEMINI_API_KEY=your-google-gemini-key
 MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net
 MONGO_DATABASE=app
 MONGO_COLLECTION=gemini_outputs
 S3_BUCKET_NAME=your-s3-bucket
+# Either point to an input file or provide inline JSON (choose one)
+APIFY_INPUT_PATH=./apify-input.json
+# APIFY_INPUT_JSON={"postURLs":["https://vm.tiktok.com/ZNdE8MYnM/"],"resultsPerPage":100,...}
 # Optional overrides
 GEMINI_SYSTEM_PROMPT=You are a helpful assistant...
 GEMINI_MODEL=gemini-1.5-pro-latest
@@ -32,6 +35,20 @@ AWS_REGION=us-east-1
 ```
 
 AWS credentials should be available to the process through the usual environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`) or an attached IAM role.
+
+The sample `APIFY_INPUT_JSON` above mirrors the TikTok scraper input:
+
+```json
+{
+  "postURLs": ["https://vm.tiktok.com/ZNdE8MYnM/"],
+  "resultsPerPage": 100,
+  "scrapeRelatedVideos": false,
+  "shouldDownloadCovers": false,
+  "shouldDownloadSlideshowImages": false,
+  "shouldDownloadSubtitles": true,
+  "shouldDownloadVideos": true
+}
+```
 
 ### 2. Run the flow locally
 
@@ -52,5 +69,6 @@ The flow logs each step in Prefect and prints the MongoDB document ID and S3 URI
 - `valerie.pipeline.PipelineConfig` holds all runtime options.
 - The flow retries network steps (Apify and download) to tolerate transient issues.
 - Gemini uploads are cleaned up after each run.
+- Apify runs use the `run-sync-get-dataset-items` endpoint, so the flow waits for the actor to complete and uses the returned dataset items.
 - Only the Gemini output and its S3 reference are saved in MongoDB.
 

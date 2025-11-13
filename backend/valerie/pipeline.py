@@ -20,8 +20,9 @@ from prefect import flow, get_run_logger, task
 class PipelineConfig:
     """Configuration required to execute the Apify to Gemini pipeline."""
 
-    apify_dataset_id: str
+    apify_actor_id: str
     apify_token: str
+    apify_input: dict[str, Any]
     gemini_api_key: str
     system_prompt: str
     mongo_uri: str
@@ -46,27 +47,52 @@ class PipelineError(RuntimeError):
     """Raised when the pipeline cannot proceed with the supplied inputs."""
 
 
-@task(name="Fetch Apify dataset items", retries=3, retry_delay_seconds=10)
-def fetch_apify_items(config: PipelineConfig) -> list[dict[str, Any]]:
-    """Retrieve dataset items for the given Apify dataset."""
+@task(name="Run Apify actor", retries=2, retry_delay_seconds=30)
+def run_apify_actor(config: PipelineConfig) -> list[dict[str, Any]]:
+    """Invoke the configured Apify actor and return its dataset items."""
     logger = get_run_logger()
-    logger.info("Fetching Apify dataset %s", config.apify_dataset_id)
+    logger.info("Running Apify actor %s", config.apify_actor_id)
 
-    dataset_url = f"https://api.apify.com/v2/datasets/{config.apify_dataset_id}/items"
-    params = {"token": config.apify_token, "format": "json"}
+    run_url = (
+        f"https://api.apify.com/v2/acts/{config.apify_actor_id}/run-sync-get-dataset-items"
+    )
+    params = {"token": config.apify_token}
 
-    with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
-        response = client.get(dataset_url, params=params)
+    with httpx.Client(timeout=httpx.Timeout(120.0)) as client:
+        response = client.post(run_url, params=params, json=config.apify_input)
         response.raise_for_status()
         items = response.json()
 
     if not isinstance(items, list) or not items:
         raise PipelineError(
-            "Apify dataset returned no items. Check dataset ID and permissions."
+            "Apify actor returned no items. Check actor input and permissions."
         )
 
-    logger.info("Retrieved %s records from Apify dataset", len(items))
+    logger.info("Retrieved %s records from Apify actor run", len(items))
     return items
+
+
+def _pick_url(value: Any) -> str | None:
+    """Heuristic to extract a URL string from nested structures."""
+    if isinstance(value, str) and value.startswith("http"):
+        return value
+    if isinstance(value, list):
+        for entry in value:
+            candidate = _pick_url(entry)
+            if candidate:
+                return candidate
+    if isinstance(value, dict):
+        for key in (
+            "url",
+            "urlNoWatermark",
+            "urlWatermark",
+            "downloadUrl",
+            "videoUrl",
+        ):
+            candidate = _pick_url(value.get(key))
+            if candidate:
+                return candidate
+    return None
 
 
 @task(name="Select video payload")
@@ -75,10 +101,27 @@ def select_video_payload(
 ) -> VideoArtifact:
     """Pick the first dataset item that contains a downloadable video URL."""
     logger = get_run_logger()
+    fallback_keys = {
+        video_url_key,
+        video_url_key.lower(),
+        "videoUrl",
+        "videoUrlNoWatermark",
+        "video_url",
+    }
+
     for item in items:
         if not isinstance(item, dict):
             continue
-        url = item.get(video_url_key) or item.get(video_url_key.lower())
+        url: str | None = None
+        for key in fallback_keys:
+            url = _pick_url(item.get(key))
+            if url:
+                break
+        if not url:
+            video_meta = item.get("video")
+            if isinstance(video_meta, dict):
+                url = _pick_url(video_meta.get(video_url_key)) or _pick_url(video_meta)
+
         if url:
             logger.info("Selected video URL %s", url)
             return VideoArtifact(url=url, payload=item)
@@ -185,7 +228,7 @@ def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
     logger = get_run_logger()
     logger.info("Starting Apify to Gemini pipeline")
 
-    items = fetch_apify_items.submit(config).result()
+    items = run_apify_actor.submit(config).result()
     artifact = select_video_payload.submit(items, config.video_url_key).result()
     video_path = download_video.submit(artifact).result()
     gemini_response_future = call_gemini.submit(
@@ -219,7 +262,7 @@ def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
     )
     return {
         "document_id": document_id,
-        "video_path": str(video_path),
         "s3_uri": s3_uri,
+        "apify_actor_id": config.apify_actor_id,
     }
 
