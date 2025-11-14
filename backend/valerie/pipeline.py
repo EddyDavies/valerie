@@ -1,20 +1,59 @@
-"""Prefect flow that pulls video data from Apify, analyzes it with Gemini, and
-stores the output in MongoDB without persisting artifacts to S3."""
+DEFAULT_CLIPTAGGER_API_URL = "https://api.inference.net/v1/chat/completions"
+DEFAULT_CLIPTAGGER_MODEL = "cliptagger-12b"
+DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 2.0
+DEFAULT_MAX_FRAMES = 150
+
+CLIPTAGGER_SYSTEM_PROMPT = (
+    "You are an image annotation API trained to analyze YouTube video keyframes. "
+    "You will be given instructions on the output format, what to caption, and how "
+    "to perform your job. Follow those instructions. For descriptions and summaries, "
+    "provide them directly and do not lead them with 'This image shows' or 'This "
+    "keyframe displays...', just get right into the details."
+)
+
+CLIPTAGGER_USER_PROMPT = """You are an image annotation API trained to analyze YouTube video keyframes. You must respond with a valid JSON object matching the exact structure below.
+
+Your job is to extract detailed **factual elements directly visible** in the image. Do not speculate or interpret artistic intent, camera focus, or composition. Do not include phrases like "this appears to be", "this looks like", or anything about the image itself. Describe what **is physically present in the frame**, and nothing more.
+
+Return JSON in this structure:
+
+{
+    "description": "A detailed, factual account of what is visibly happening (4 sentences max). Only mention concrete elements or actions that are clearly shown. Do not include anything about how the image is styled, shot, or composed. Do not lead the description with something like 'This image shows' or 'this keyframe is...', just get right into the details.",
+    "objects": ["object1 with relevant visual details", "object2 with relevant visual details", ...],
+    "actions": ["action1 with participants and context", "action2 with participants and context", ...],
+    "environment": "Detailed factual description of the setting and atmosphere based on visible cues (e.g., interior of a classroom with fluorescent lighting, or outdoor forest path with snow-covered trees).",
+    "content_type": "The type of content it is, e.g. 'real-world footage', 'video game', 'animation', 'cartoon', 'CGI', 'VTuber', etc.",
+    "specific_style": "Specific genre, aesthetic, or platform style (e.g., anime, 3D animation, mobile gameplay, vlog, tutorial, news broadcast, etc.)",
+    "production_quality": "Visible production level: e.g., 'professional studio', 'amateur handheld', 'webcam recording', 'TV broadcast', etc.",
+    "summary": "One clear, comprehensive sentence summarizing the visual content of the frame. Like the description, get right to the point.",
+    "logos": ["logo1 with visual description", "logo2 with visual description", ...]
+}
+
+Rules:
+- Be specific and literal. Focus on what is explicitly visible.
+- Do NOT include interpretations of emotion, mood, or narrative unless it's visually explicit.
+- No artistic or cinematic analysis.
+- Always include the language of any text in the image if present as an object, e.g. "English text", "Japanese text", "Russian text", etc.
+- Maximum 10 objects and 5 actions.
+- Return an empty array for 'logos' if none are present.
+- Always output strictly valid JSON with proper escaping.
+- Output **only the JSON**, no extra text or explanation.
+"""
+"""Prefect flow that pulls video data from Apify, analyzes it with ClipTagger-12b,
+and stores the output in MongoDB without persisting artifacts to S3."""
 
 from __future__ import annotations
 
+import base64
 import json
-import re
 import shutil
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
-import google.generativeai as genai
 import httpx
 from pymongo import MongoClient
 from prefect import flow, get_run_logger, task
@@ -22,17 +61,21 @@ from prefect import flow, get_run_logger, task
 
 @dataclass(slots=True)
 class PipelineConfig:
-    """Configuration required to execute the Apify to Gemini pipeline."""
+    """Configuration required to execute the Apify to ClipTagger pipeline."""
 
     apify_actor_id: str
     apify_token: str
     apify_input: dict[str, Any]
-    gemini_api_key: str
-    system_prompt: str
-    mongo_uri: str | None
-    mongo_database: str | None
-    mongo_collection: str | None
-    gemini_model: str = "gemini-2.5-pro"
+    cliptagger_api_key: str
+    mongo_uri: str | None = None
+    mongo_database: str | None = None
+    mongo_collection: str | None = None
+    cliptagger_api_url: str = DEFAULT_CLIPTAGGER_API_URL
+    cliptagger_model: str = DEFAULT_CLIPTAGGER_MODEL
+    cliptagger_system_prompt: str = CLIPTAGGER_SYSTEM_PROMPT
+    cliptagger_user_prompt: str = CLIPTAGGER_USER_PROMPT
+    frame_sample_interval_seconds: float = DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS
+    max_frames: int = DEFAULT_MAX_FRAMES
     run_local: bool = False
 
 
@@ -42,6 +85,23 @@ class VideoArtifact:
 
     url: str
     payload: dict[str, Any]
+
+
+@dataclass(slots=True)
+class FrameSample:
+    """Metadata for a sampled video frame stored on disk."""
+
+    path: Path
+    timestamp: float
+
+
+@dataclass(slots=True)
+class FrameAnalysis:
+    """Structured ClipTagger output paired with its frame metadata."""
+
+    timestamp: float
+    data: dict[str, Any]
+    raw_response: dict[str, Any]
 
 
 class PipelineError(RuntimeError):
@@ -96,231 +156,6 @@ def _pick_url(value: Any) -> str | None:
     return None
 
 
-_TIMECODE_PATTERN = re.compile(
-    r"^(?:(?P<hours>\d+):)?(?P<minutes>\d{1,2}):(?P<seconds>\d{2})(?:[.,](?P<millis>\d{1,3}))?$"
-)
-
-
-def _strip_code_fence(text: str) -> str:
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```[a-zA-Z0-9]*\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    return cleaned.strip()
-
-
-def _try_parse_json(text: str) -> dict[str, Any] | None:
-    cleaned = _strip_code_fence(text)
-    if not cleaned:
-        return None
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            snippet = cleaned[start : end + 1]
-            try:
-                return json.loads(snippet)
-            except json.JSONDecodeError:
-                return None
-    return None
-
-
-def _collect_screenshot_suggestions(gemini_response: dict[str, Any]) -> list[dict[str, Any]]:
-    if not isinstance(gemini_response, dict):
-        return []
-
-    direct = gemini_response.get("screenshots")
-    if isinstance(direct, list):
-        return [entry for entry in direct if isinstance(entry, dict)]
-
-    candidates = gemini_response.get("candidates", [])
-    if not isinstance(candidates, list):
-        return []
-
-    for candidate in candidates:
-        content = candidate.get("content")
-        if isinstance(content, dict):
-            raw_parts = content.get("parts") or []
-        elif isinstance(content, list):
-            raw_parts = content
-        else:
-            raw_parts = []
-
-        for part in raw_parts:
-            if not isinstance(part, dict):
-                continue
-            text = part.get("text")
-            if not isinstance(text, str):
-                continue
-            payload = _try_parse_json(text)
-            if isinstance(payload, dict):
-                suggestions = payload.get("screenshots")
-                if isinstance(suggestions, list):
-                    structured = [
-                        suggestion
-                        for suggestion in suggestions
-                        if isinstance(suggestion, dict)
-                    ]
-                    if structured:
-                        return structured
-    return []
-
-
-def _coerce_float(value: Any) -> float | None:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        try:
-            return float(stripped)
-        except ValueError:
-            return None
-    return None
-
-
-def _parse_timestamp_string(value: str) -> float | None:
-    match = _TIMECODE_PATTERN.match(value.strip())
-    if not match:
-        return None
-    hours = int(match.group("hours") or 0)
-    minutes = int(match.group("minutes"))
-    seconds = int(match.group("seconds"))
-    millis_group = match.group("millis")
-    millis = int(millis_group.ljust(3, "0")) if millis_group else 0
-    return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
-
-
-def _seconds_from_screenshot_entry(entry: dict[str, Any]) -> float | None:
-    if not isinstance(entry, dict):
-        return None
-
-    for key in ("timestamp_ms", "timecode_ms", "millisecond_total"):
-        if key in entry:
-            total_ms = _coerce_float(entry.get(key))
-            if total_ms is not None:
-                return max(total_ms, 0.0) / 1000.0
-
-    second = None
-    for key in ("second", "seconds"):
-        if key in entry:
-            second = _coerce_float(entry.get(key))
-            if second is not None:
-                break
-
-    if second is None and "milliseconds" in entry:
-        total_ms = _coerce_float(entry.get("milliseconds"))
-        if total_ms is not None:
-            return max(total_ms, 0.0) / 1000.0
-
-    millisecond = None
-    for key in ("millisecond", "milliseconds", "millisecondOffset", "ms"):
-        if key in entry:
-            millisecond = _coerce_float(entry.get(key))
-            if millisecond is not None:
-                break
-
-    if second is not None:
-        millis = millisecond if millisecond is not None else 0.0
-        return max(second + millis / 1000.0, 0.0)
-
-    for key in ("timestamp", "timecode"):
-        raw = entry.get(key)
-        if isinstance(raw, str):
-            parsed = _parse_timestamp_string(raw)
-            if parsed is not None:
-                return max(parsed, 0.0)
-    return None
-
-
-@task(name="Extract screenshots", persist_result=False)
-def extract_screenshots(video_path: Path, gemini_response: dict[str, Any]) -> dict[str, Any]:
-    """Generate image files for each screenshot suggestion using ffmpeg."""
-    logger = get_run_logger()
-    suggestions = _collect_screenshot_suggestions(gemini_response)
-
-    if not suggestions:
-        logger.info("No screenshot suggestions detected; skipping ffmpeg extraction.")
-        return {"suggestions": [], "images": []}
-
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        logger.warning(
-            "ffmpeg executable not found on PATH. Returning suggestions without extraction."
-        )
-        return {"suggestions": suggestions, "images": []}
-
-    screenshot_root = video_path.parent / "screenshots"
-    screenshot_root.mkdir(parents=True, exist_ok=True)
-
-    artifacts: list[dict[str, Any]] = []
-    for index, suggestion in enumerate(suggestions, start=1):
-        timestamp_seconds = _seconds_from_screenshot_entry(suggestion)
-        if timestamp_seconds is None:
-            logger.warning(
-                "Skipping screenshot suggestion %s due to missing timestamp data: %s",
-                index,
-                suggestion,
-            )
-            continue
-
-        timestamp_seconds = max(timestamp_seconds, 0.0)
-        filename = f"screenshot_{index:02d}_{timestamp_seconds:06.3f}.jpg"
-        output_path = screenshot_root / filename
-
-        command = [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            f"{timestamp_seconds:.3f}",
-            "-i",
-            str(video_path),
-            "-frames:v",
-            "1",
-            "-y",
-            str(output_path),
-        ]
-
-        logger.info(
-            "Extracting screenshot %s at %s seconds to %s",
-            index,
-            f"{timestamp_seconds:.3f}",
-            output_path,
-        )
-
-        try:
-            process = subprocess.run(command, capture_output=True, text=True, check=False)
-        except OSError as exc:
-            logger.warning("Failed to invoke ffmpeg for screenshot %s: %s", index, exc)
-            continue
-
-        if process.returncode != 0:
-            stderr = process.stderr.strip()
-            logger.warning(
-                "ffmpeg exited with code %s for screenshot %s: %s",
-                process.returncode,
-                index,
-                stderr or "no stderr output",
-            )
-            continue
-
-        artifacts.append(
-            {
-                "path": str(output_path),
-                "timestamp_seconds": round(timestamp_seconds, 3),
-                "suggestion": suggestion,
-            }
-        )
-
-    logger.info("Extracted %s screenshot(s) via ffmpeg", len(artifacts))
-    return {"suggestions": suggestions, "images": artifacts}
-
-
 @task(name="Select video payload")
 def select_video_payload(items: Iterable[dict[str, Any]]) -> VideoArtifact:
     """Pick the first dataset item that contains a downloadable video URL."""
@@ -364,62 +199,196 @@ def download_video(artifact: VideoArtifact) -> Path:
     return file_path
 
 
-@task(name="Generate Gemini response")
-def call_gemini(
-    video_path: Path, system_prompt: str, gemini_api_key: str, model_name: str
+def _build_cliptagger_payload(
+    *,
+    image_base64: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
 ) -> dict[str, Any]:
-    """Upload the video to Gemini and return the structured response."""
-    logger = get_run_logger()
-    logger.info("Calling Gemini model %s with uploaded video", model_name)
+    return {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}",
+                        },
+                    },
+                ],
+            },
+        ],
+        "temperature": 0.1,
+        "max_output_tokens": 2000,
+        "response_format": {"type": "json_object"},
+    }
 
-    genai.configure(api_key=gemini_api_key)
-    model = genai.GenerativeModel(
-        model_name=model_name,
-        system_instruction=system_prompt,
+
+def _extract_message_content(response_json: dict[str, Any]) -> str:
+    """Best-effort extraction of text content from OpenAI-style responses."""
+    choices = response_json.get("choices") or []
+    if not choices:
+        raise PipelineError("ClipTagger response did not include any choices.")
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in {"text", "output_text"}:
+                text = part.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        if text_parts:
+            return "".join(text_parts).strip()
+
+    raise PipelineError("ClipTagger response did not contain textual content.")
+
+
+@task(name="Extract video frames", retries=2, retry_delay_seconds=15)
+def extract_video_frames(
+    video_path: Path, sample_interval_seconds: float, max_frames: int
+) -> list[FrameSample]:
+    """Sample still frames from the video using ffmpeg."""
+    logger = get_run_logger()
+    if sample_interval_seconds <= 0:
+        raise PipelineError("Frame sampling interval must be greater than zero.")
+    if max_frames <= 0:
+        raise PipelineError("Max frames must be greater than zero.")
+
+    frames_dir = video_path.parent / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    frame_output = frames_dir / "frame_%05d.jpg"
+    frame_rate = 1.0 / sample_interval_seconds
+
+    logger.info(
+        "Extracting frames using ffmpeg (fps=%s, max_frames=%s)",
+        f"{frame_rate:.4f}",
+        max_frames,
     )
 
-    uploaded_file = genai.upload_file(path=str(video_path))
-    logger.info("Uploaded file to Gemini resource %s", uploaded_file.name)
+    command = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"fps={frame_rate:.6f}",
+        "-q:v",
+        "2",
+    ]
 
-    max_attempts = 15
-    poll_interval = 2.0
-    for attempt in range(1, max_attempts + 1):
-        file_status = genai.get_file(name=uploaded_file.name)
-        state_value = getattr(file_status, "state", None)
-        state = getattr(state_value, "name", state_value)
-        if state == "ACTIVE":
+    if max_frames:
+        command.extend(["-frames:v", str(max_frames)])
+
+    command.append(str(frame_output))
+
+    process = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    if process.returncode != 0:
+        logger.error(
+            "ffmpeg failed with return code %s and stderr: %s",
+            process.returncode,
+            process.stderr,
+        )
+        raise PipelineError("Failed to extract frames with ffmpeg.")
+
+    frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
+    if not frame_paths:
+        raise PipelineError("Frame extraction produced no frames.")
+
+    samples: list[FrameSample] = [
+        FrameSample(path=path, timestamp=round(index * sample_interval_seconds, 3))
+        for index, path in enumerate(frame_paths[:max_frames])
+    ]
+
+    logger.info("Extracted %s frames for ClipTagger analysis", len(samples))
+    return samples
+
+
+@task(name="Run ClipTagger analysis", retries=2, retry_delay_seconds=10)
+def analyze_frames_with_cliptagger(
+    frames: Sequence[FrameSample],
+    api_key: str,
+    api_url: str,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> list[FrameAnalysis]:
+    """Send sampled frames to the ClipTagger-12b API."""
+    logger = get_run_logger()
+    if not frames:
+        raise PipelineError("No frames available for ClipTagger analysis.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    analyses: list[FrameAnalysis] = []
+    with httpx.Client(timeout=httpx.Timeout(60.0)) as client:
+        for index, frame in enumerate(frames, start=1):
+            image_bytes = frame.path.read_bytes()
+            encoded = base64.b64encode(image_bytes).decode("ascii")
+            payload = _build_cliptagger_payload(
+                image_base64=encoded,
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
             logger.info(
-                "Gemini file %s became ACTIVE on attempt %s/%s",
-                uploaded_file.name,
-                attempt,
-                max_attempts,
+                "Submitting frame %s/%s to ClipTagger (timestamp=%ss, size=%s bytes)",
+                index,
+                len(frames),
+                frame.timestamp,
+                len(image_bytes),
             )
-            break
-        if state == "FAILED":
-            raise PipelineError(
-                f"Gemini file {uploaded_file.name} processing failed with state=FAILED"
+            response = client.post(api_url, headers=headers, json=payload)
+            response.raise_for_status()
+            response_json = response.json()
+
+            content_text = _extract_message_content(response_json)
+            try:
+                parsed_data = json.loads(content_text)
+            except json.JSONDecodeError as exc:
+                logger.error(
+                    "ClipTagger response for frame at %ss was not valid JSON: %s",
+                    frame.timestamp,
+                    exc,
+                )
+                raise PipelineError(
+                    f"ClipTagger returned invalid JSON for timestamp {frame.timestamp}s"
+                ) from exc
+
+            analyses.append(
+                FrameAnalysis(
+                    timestamp=frame.timestamp,
+                    data=parsed_data,
+                    raw_response=response_json,
+                )
             )
 
-        logger.info(
-            "Gemini file %s not ready yet (state=%s); waiting %.1fs before retry %s/%s",
-            uploaded_file.name,
-            state or "UNKNOWN",
-            poll_interval,
-            attempt,
-            max_attempts,
-        )
-        time.sleep(poll_interval)
-    else:
-        raise PipelineError(
-            f"Gemini file {uploaded_file.name} did not reach ACTIVE state after "
-            f"{max_attempts * poll_interval:.0f}s"
-        )
-
-    response = model.generate_content([uploaded_file])
-    response_dict = response.to_dict()
-    logger.info("Gemini response received with %s candidates", len(response.candidates))
-
-    return response_dict
+    logger.info("ClipTagger analysis complete for %s frames", len(analyses))
+    return analyses
 
 
 @task(name="Delete local video", persist_result=False)
@@ -443,57 +412,41 @@ def delete_local_video(video_path: Path) -> None:
     temp_dir = video_path.parent
     if temp_dir.exists():
         try:
-            has_additional_artifacts = any(temp_dir.iterdir())
-        except OSError as exc:
-            logger.warning("Could not inspect temporary directory %s: %s", temp_dir, exc)
-            return
-
-        if has_additional_artifacts:
-            logger.info(
-                "Preserving temporary directory %s because it still contains artifacts.",
-                temp_dir,
-            )
-            return
-
-        try:
             shutil.rmtree(temp_dir, ignore_errors=True)
             logger.info("Removed temporary directory %s", temp_dir)
         except OSError as exc:
             logger.warning("Failed to remove temporary directory %s: %s", temp_dir, exc)
 
 
-@task(name="Persist Gemini response to MongoDB")
-def persist_response(
+@task(name="Persist ClipTagger analysis to MongoDB")
+def persist_analysis(
     mongo_uri: str,
     database: str,
     collection: str,
-    gemini_payload: dict[str, Any],
+    analysis_payload: dict[str, Any],
     video_url: str,
     video_payload: dict[str, Any],
-    screenshots: dict[str, Any] | None = None,
 ) -> str:
-    """Persist the Gemini output and source metadata in MongoDB."""
+    """Persist the ClipTagger output and source metadata in MongoDB."""
     logger = get_run_logger()
     document = {
         "video_url": video_url,
         "video_payload": video_payload,
-        "output": gemini_payload,
+        "analysis": analysis_payload,
     }
-    if screenshots is not None:
-        document["screenshots"] = screenshots
 
     with MongoClient(mongo_uri, serverSelectionTimeoutMS=5000) as client:
         result = client[database][collection].insert_one(document)
         inserted_id = str(result.inserted_id)
 
-    logger.info("Stored Gemini response under MongoDB document %s", inserted_id)
+    logger.info("Stored ClipTagger analysis under MongoDB document %s", inserted_id)
     return inserted_id
 
 
 # --- Local persistence fallback (RUN_LOCAL), remove when Mongo is mandatory ---
-@task(name="Persist Gemini response locally", persist_result=False)
-def persist_response_locally(document: dict[str, Any]) -> str:
-    """Persist the Gemini output to a local JSON file when MongoDB is disabled."""
+@task(name="Persist ClipTagger analysis locally", persist_result=False)
+def persist_analysis_locally(document: dict[str, Any]) -> str:
+    """Persist the ClipTagger output to a local JSON file when MongoDB is disabled."""
     logger = get_run_logger()
     output_dir = Path(__file__).resolve().parent / "local_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -505,54 +458,70 @@ def persist_response_locally(document: dict[str, Any]) -> str:
     file_path = output_dir / f"{safe_stub}-{uuid4().hex}.json"
     file_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
 
-    logger.info("Saved Gemini response locally to %s", file_path)
+    logger.info("Saved ClipTagger analysis locally to %s", file_path)
     return str(file_path)
 
 
-@flow(name="Apify to Gemini pipeline")
-def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
+@flow(name="Apify to ClipTagger pipeline")
+def apify_to_cliptagger_flow(config: PipelineConfig) -> dict[str, Any]:
     """Prefect entry point that orchestrates the full pipeline."""
     logger = get_run_logger()
-    logger.info("Starting Apify to Gemini pipeline")
+    logger.info("Starting Apify to ClipTagger pipeline")
 
     items = run_apify_actor.submit(config).result()
     artifact = select_video_payload.submit(items).result()
     video_path = download_video.submit(artifact).result()
-    gemini_response_future = call_gemini.submit(
+    frame_samples_future = extract_video_frames.submit(
         video_path,
-        config.system_prompt,
-        config.gemini_api_key,
-        config.gemini_model,
+        config.frame_sample_interval_seconds,
+        config.max_frames,
+    )
+    cliptagger_response_future = analyze_frames_with_cliptagger.submit(
+        frame_samples_future,
+        config.cliptagger_api_key,
+        config.cliptagger_api_url,
+        config.cliptagger_model,
+        config.cliptagger_system_prompt,
+        config.cliptagger_user_prompt,
     )
 
-    gemini_response = gemini_response_future.result()
+    frame_analyses = cliptagger_response_future.result()
 
-    screenshots_future = extract_screenshots.submit(video_path, gemini_response)
-    screenshots = screenshots_future.result()
+    analysis_payload = {
+        "model": config.cliptagger_model,
+        "sample_interval_seconds": config.frame_sample_interval_seconds,
+        "max_frames": config.max_frames,
+        "frames": [
+            {
+                "frame_index": index,
+                "timestamp": analysis.timestamp,
+                "data": analysis.data,
+                "raw_response": analysis.raw_response,
+            }
+            for index, analysis in enumerate(frame_analyses)
+        ],
+    }
 
     document = {
         "video_url": artifact.url,
         "video_payload": artifact.payload,
-        "output": gemini_response,
+        "analysis": analysis_payload,
     }
-    if screenshots:
-        document["screenshots"] = screenshots
 
     if config.run_local:
-        document_id = persist_response_locally.submit(document).result()
+        document_id = persist_analysis_locally.submit(document).result()
     else:
-        document_id = persist_response.submit(
+        document_id = persist_analysis.submit(
             config.mongo_uri or "",
             config.mongo_database or "",
             config.mongo_collection or "",
-            gemini_response,
+            analysis_payload,
             artifact.url,
             artifact.payload,
-            screenshots,
         ).result()
 
     cleanup_future = delete_local_video.submit(
-        video_path, wait_for=[gemini_response_future, screenshots_future]
+        video_path, wait_for=[cliptagger_response_future]
     )
     cleanup_future.result()
 
@@ -565,6 +534,5 @@ def apify_to_gemini_flow(config: PipelineConfig) -> dict[str, Any]:
         "document_id": document_id,
         "video_url": artifact.url,
         "apify_actor_id": config.apify_actor_id,
-        "screenshots": screenshots,
     }
 

@@ -7,7 +7,6 @@ requires-python = ">=3.14"
 dependencies = [
     "prefect>=3.0.0",
     "httpx>=0.27.2",
-    "google-generativeai>=0.5.4",
     "python-dotenv>=1.0.1",
     "pymongo>=4.8.0",
     "boto3>=1.35.0",
