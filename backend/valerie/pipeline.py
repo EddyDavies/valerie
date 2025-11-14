@@ -12,8 +12,9 @@ from typing import Any, Iterable
 import boto3
 import google.generativeai as genai
 import httpx
-from pymongo import MongoClient
 from prefect import flow, get_run_logger, task
+
+from valerie.db import insert_document
 
 
 @dataclass(slots=True)
@@ -171,9 +172,13 @@ def persist_response(
         "output": gemini_payload,
     }
 
-    with MongoClient(mongo_uri, serverSelectionTimeoutMS=5000) as client:
-        result = client[database][collection].insert_one(document)
-        inserted_id = str(result.inserted_id)
+    # Use the centralized database module for MongoDB operations
+    inserted_id = insert_document(
+        document=document,
+        mongo_uri=mongo_uri,
+        database=database,
+        collection=collection,
+    )
 
     logger.info("Stored Gemini response under MongoDB document %s", inserted_id)
     return inserted_id
