@@ -55,6 +55,7 @@ The flow logs each step in Prefect and prints the MongoDB document ID and source
 - Gemini uploads are cleaned up after each run.
 - Apify runs use the `run-sync-get-dataset-items` endpoint, so the flow waits for the actor to complete and uses the returned dataset items.
 - Only the Gemini output, the original Apify payload, and the source video URL are saved in MongoDB. 
+- When Gemini suggests screenshots, the pipeline uses `ffmpeg` to extract the corresponding frames and stores their metadata alongside the analysis results.
 - The Apify actor input is generated dynamically; pass the target URL via `--url` or set `APIFY_POST_URL`.
 - Set `RUN_LOCAL=true` to activate the temporary JSON fallback (`backend/valerie/local_outputs/`) when MongoDB is unavailable. Remove this flag once Mongo connectivity is guaranteed.
 
