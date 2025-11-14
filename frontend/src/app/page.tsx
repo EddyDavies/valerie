@@ -4,8 +4,8 @@ import { Button } from "@/components/ui/button";
 
 export default function Home() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex w-full max-w-md flex-col items-center justify-center gap-8 px-4">
+    <div className="flex min-h-screen items-start justify-center bg-background font-sans pt-5">
+      <main className="flex w-full max-w-md flex-col items-center gap-8 px-4">
         <h1 className="text-6xl font-bold tracking-tight">Valerie</h1>
         <Card className="w-full">
           <CardHeader className="gap-0 text-center">
