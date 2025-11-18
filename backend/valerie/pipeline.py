@@ -3,53 +3,16 @@ DEFAULT_CLIPTAGGER_MODEL = "cliptagger-12b"
 DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 2.0
 DEFAULT_MAX_FRAMES = 150
 
-CLIPTAGGER_SYSTEM_PROMPT = (
-    "You are an image annotation API trained to analyze YouTube video keyframes. "
-    "You will be given instructions on the output format, what to caption, and how "
-    "to perform your job. Follow those instructions. For descriptions and summaries, "
-    "provide them directly and do not lead them with 'This image shows' or 'This "
-    "keyframe displays...', just get right into the details."
-)
-
-CLIPTAGGER_USER_PROMPT = """You are an image annotation API trained to analyze YouTube video keyframes. You must respond with a valid JSON object matching the exact structure below.
-
-Your job is to extract detailed **factual elements directly visible** in the image. Do not speculate or interpret artistic intent, camera focus, or composition. Do not include phrases like "this appears to be", "this looks like", or anything about the image itself. Describe what **is physically present in the frame**, and nothing more.
-
-Return JSON in this structure:
-
-{
-    "description": "A detailed, factual account of what is visibly happening (4 sentences max). Only mention concrete elements or actions that are clearly shown. Do not include anything about how the image is styled, shot, or composed. Do not lead the description with something like 'This image shows' or 'this keyframe is...', just get right into the details.",
-    "objects": ["object1 with relevant visual details", "object2 with relevant visual details", ...],
-    "actions": ["action1 with participants and context", "action2 with participants and context", ...],
-    "environment": "Detailed factual description of the setting and atmosphere based on visible cues (e.g., interior of a classroom with fluorescent lighting, or outdoor forest path with snow-covered trees).",
-    "content_type": "The type of content it is, e.g. 'real-world footage', 'video game', 'animation', 'cartoon', 'CGI', 'VTuber', etc.",
-    "specific_style": "Specific genre, aesthetic, or platform style (e.g., anime, 3D animation, mobile gameplay, vlog, tutorial, news broadcast, etc.)",
-    "production_quality": "Visible production level: e.g., 'professional studio', 'amateur handheld', 'webcam recording', 'TV broadcast', etc.",
-    "summary": "One clear, comprehensive sentence summarizing the visual content of the frame. Like the description, get right to the point.",
-    "logos": ["logo1 with visual description", "logo2 with visual description", ...]
-}
-
-Rules:
-- Be specific and literal. Focus on what is explicitly visible.
-- Do NOT include interpretations of emotion, mood, or narrative unless it's visually explicit.
-- No artistic or cinematic analysis.
-- Always include the language of any text in the image if present as an object, e.g. "English text", "Japanese text", "Russian text", etc.
-- Maximum 10 objects and 5 actions.
-- Return an empty array for 'logos' if none are present.
-- Always output strictly valid JSON with proper escaping.
-- Output **only the JSON**, no extra text or explanation.
-"""
 """Prefect flow that pulls video data from Apify, analyzes it with ClipTagger-12b,
 and stores the output in MongoDB without persisting artifacts to S3."""
 
-from __future__ import annotations
 
 import base64
 import json
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 from uuid import uuid4
@@ -57,6 +20,18 @@ from uuid import uuid4
 import httpx
 from pymongo import MongoClient
 from prefect import flow, get_run_logger, task
+
+
+def _load_prompt_file(filename: str) -> str:
+    """Load a prompt file from the prompts directory."""
+    prompts_dir = Path(__file__).resolve().parent.parent / "prompts"
+    prompt_path = prompts_dir / filename
+    if not prompt_path.exists():
+        raise FileNotFoundError(
+            f"Prompt file not found: {prompt_path}. "
+            f"Expected prompts directory at: {prompts_dir}"
+        )
+    return prompt_path.read_text(encoding="utf-8").strip()
 
 
 @dataclass(slots=True)
@@ -72,8 +47,12 @@ class PipelineConfig:
     mongo_collection: str | None = None
     cliptagger_api_url: str = DEFAULT_CLIPTAGGER_API_URL
     cliptagger_model: str = DEFAULT_CLIPTAGGER_MODEL
-    cliptagger_system_prompt: str = CLIPTAGGER_SYSTEM_PROMPT
-    cliptagger_user_prompt: str = CLIPTAGGER_USER_PROMPT
+    cliptagger_system_prompt: str = field(
+        default_factory=lambda: _load_prompt_file("cliptagger_system.jinja")
+    )
+    cliptagger_user_prompt: str = field(
+        default_factory=lambda: _load_prompt_file("cliptagger_user.jinja")
+    )
     frame_sample_interval_seconds: float = DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS
     max_frames: int = DEFAULT_MAX_FRAMES
     run_local: bool = False
