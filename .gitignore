@@ -11,4 +11,7 @@ wheels/
 .venv
 .env
 
+.vscode/
+frontend/
+
 backend/valerie/local_outputs/

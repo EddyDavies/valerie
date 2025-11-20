@@ -26,8 +26,8 @@ MONGO_COLLECTION=cliptagger_outputs
 # Optional overrides
 RUN_LOCAL=false
 APIFY_ACTOR_ID=clockworks~tiktok-video-scraper
-CLIPTAGGER_API_URL=https://api.inference.net/v1/chat/completions
-CLIPTAGGER_MODEL=cliptagger-12b
+CLIPTAGGER_API_URL=https://api.inference.net/v1
+CLIPTAGGER_MODEL=inference-net/cliptagger-12b
 CLIPTAGGER_SAMPLE_INTERVAL_SECONDS=2.0
 CLIPTAGGER_MAX_FRAMES=150
 ```

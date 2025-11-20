@@ -1,5 +1,5 @@
-DEFAULT_CLIPTAGGER_API_URL = "https://api.inference.net/v1/chat/completions"
-DEFAULT_CLIPTAGGER_MODEL = "cliptagger-12b"
+DEFAULT_CLIPTAGGER_API_URL = "https://api.inference.net/v1"
+DEFAULT_CLIPTAGGER_MODEL = "inference-net/cliptagger-12b"
 DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS = 2.0
 DEFAULT_MAX_FRAMES = 150
 
@@ -18,6 +18,7 @@ from typing import Any, Iterable, Sequence
 from uuid import uuid4
 
 import httpx
+from openai import OpenAI
 from pymongo import MongoClient
 from prefect import flow, get_run_logger, task
 
@@ -178,64 +179,6 @@ def download_video(artifact: VideoArtifact) -> Path:
     return file_path
 
 
-def _build_cliptagger_payload(
-    *,
-    image_base64: str,
-    model_name: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> dict[str, Any]:
-    return {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_prompt}],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}",
-                        },
-                    },
-                ],
-            },
-        ],
-        "temperature": 0.1,
-        "max_output_tokens": 2000,
-        "response_format": {"type": "json_object"},
-    }
-
-
-def _extract_message_content(response_json: dict[str, Any]) -> str:
-    """Best-effort extraction of text content from OpenAI-style responses."""
-    choices = response_json.get("choices") or []
-    if not choices:
-        raise PipelineError("ClipTagger response did not include any choices.")
-
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-
-    if isinstance(content, str):
-        return content.strip()
-
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") in {"text", "output_text"}:
-                text = part.get("text")
-                if isinstance(text, str):
-                    text_parts.append(text)
-        if text_parts:
-            return "".join(text_parts).strip()
-
-    raise PipelineError("ClipTagger response did not contain textual content.")
-
-
 @task(name="Extract video frames", retries=2, retry_delay_seconds=15)
 def extract_video_frames(
     video_path: Path, sample_interval_seconds: float, max_frames: int
@@ -312,59 +255,88 @@ def analyze_frames_with_cliptagger(
     system_prompt: str,
     user_prompt: str,
 ) -> list[FrameAnalysis]:
-    """Send sampled frames to the ClipTagger-12b API."""
+    """Send sampled frames to the ClipTagger-12b API using OpenAI SDK."""
     logger = get_run_logger()
     if not frames:
         raise PipelineError("No frames available for ClipTagger analysis.")
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    client = OpenAI(
+        base_url=api_url,
+        api_key=api_key,
+        timeout=60.0,
+    )
+
+    logger.info("ClipTagger API base_url: %s", api_url)
+    logger.info("ClipTagger model: %s", model_name)
 
     analyses: list[FrameAnalysis] = []
-    with httpx.Client(timeout=httpx.Timeout(60.0)) as client:
-        for index, frame in enumerate(frames, start=1):
-            image_bytes = frame.path.read_bytes()
-            encoded = base64.b64encode(image_bytes).decode("ascii")
-            payload = _build_cliptagger_payload(
-                image_base64=encoded,
-                model_name=model_name,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
+    for index, frame in enumerate(frames, start=1):
+        image_bytes = frame.path.read_bytes()
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+
+        logger.info(
+            "Submitting frame %s/%s to ClipTagger (timestamp=%ss, size=%s bytes)",
+            index,
+            len(frames),
+            frame.timestamp,
+            len(image_bytes),
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system", "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": user_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{encoded}",
+                                },
+                            },
+                        ],
+                    },
+                ],
+                temperature=0.1,
+                max_tokens=2000,
+                response_format={"type": "json_object"},
+            )
+        except Exception as api_exc:
+            logger.error("ClipTagger API error: %s", api_exc)
+            logger.error("API URL: %s", api_url)
+            logger.error("Model: %s", model_name)
+            raise PipelineError(f"ClipTagger API request failed: {api_exc}") from api_exc
+
+        content_text = response.choices[0].message.content
+        if not content_text:
+            raise PipelineError(
+                f"ClipTagger returned empty content for timestamp {frame.timestamp}s"
             )
 
-            logger.info(
-                "Submitting frame %s/%s to ClipTagger (timestamp=%ss, size=%s bytes)",
-                index,
-                len(frames),
+        try:
+            parsed_data = json.loads(content_text)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "ClipTagger response for frame at %ss was not valid JSON: %s",
                 frame.timestamp,
-                len(image_bytes),
+                exc,
             )
-            response = client.post(api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            response_json = response.json()
+            raise PipelineError(
+                f"ClipTagger returned invalid JSON for timestamp {frame.timestamp}s"
+            ) from exc
 
-            content_text = _extract_message_content(response_json)
-            try:
-                parsed_data = json.loads(content_text)
-            except json.JSONDecodeError as exc:
-                logger.error(
-                    "ClipTagger response for frame at %ss was not valid JSON: %s",
-                    frame.timestamp,
-                    exc,
-                )
-                raise PipelineError(
-                    f"ClipTagger returned invalid JSON for timestamp {frame.timestamp}s"
-                ) from exc
-
-            analyses.append(
-                FrameAnalysis(
-                    timestamp=frame.timestamp,
-                    data=parsed_data,
-                    raw_response=response_json,
-                )
+        analyses.append(
+            FrameAnalysis(
+                timestamp=frame.timestamp,
+                data=parsed_data,
+                raw_response=response.model_dump(),
             )
+        )
 
     logger.info("ClipTagger analysis complete for %s frames", len(analyses))
     return analyses

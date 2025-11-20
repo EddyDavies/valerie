@@ -5,8 +5,6 @@ from typing import Any
 from dotenv import load_dotenv
 
 from valerie.pipeline import (
-    CLIPTAGGER_SYSTEM_PROMPT,
-    CLIPTAGGER_USER_PROMPT,
     DEFAULT_CLIPTAGGER_API_URL,
     DEFAULT_CLIPTAGGER_MODEL,
     DEFAULT_FRAME_SAMPLE_INTERVAL_SECONDS,
@@ -76,10 +74,10 @@ def build_config(video_url: str | None) -> PipelineConfig:
             "Define them in your shell or .env file."
         )
 
-    cliptagger_api_url = environ.get(
-        "CLIPTAGGER_API_URL", DEFAULT_CLIPTAGGER_API_URL
-    ).strip()
-    cliptagger_model = environ.get("CLIPTAGGER_MODEL", DEFAULT_CLIPTAGGER_MODEL).strip()
+    # cliptagger_api_url = environ.get(
+    #     "CLIPTAGGER_API_URL", DEFAULT_CLIPTAGGER_API_URL
+    # ).strip()
+    # cliptagger_model = environ.get("CLIPTAGGER_MODEL", DEFAULT_CLIPTAGGER_MODEL).strip()
 
     sample_interval_value = environ.get("CLIPTAGGER_SAMPLE_INTERVAL_SECONDS")
     if sample_interval_value:
@@ -113,10 +111,8 @@ def build_config(video_url: str | None) -> PipelineConfig:
         mongo_uri=None if run_local else environ["MONGO_URI"],
         mongo_database=None if run_local else environ["MONGO_DATABASE"],
         mongo_collection=None if run_local else environ["MONGO_COLLECTION"],
-        cliptagger_api_url=cliptagger_api_url,
-        cliptagger_model=cliptagger_model or DEFAULT_CLIPTAGGER_MODEL,
-        cliptagger_system_prompt=CLIPTAGGER_SYSTEM_PROMPT,
-        cliptagger_user_prompt=CLIPTAGGER_USER_PROMPT,
+        # cliptagger_api_url=cliptagger_api_url,
+        # cliptagger_model=cliptagger_model or DEFAULT_CLIPTAGGER_MODEL,
         frame_sample_interval_seconds=sample_interval,
         max_frames=max_frames,
         run_local=run_local,
